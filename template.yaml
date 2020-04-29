@@ -1,0 +1,142 @@
+# oc process -f template.yaml | oc create -f -
+# ServiceAccount
+# oc adm policy add-scc-to-user privileged system:serviceaccount:${NS_NAME}:${SA_NAME}
+# TODO: storage for backup location this is just a dummy test on local on hostPath volumes
+apiVersion: v1
+kind: Template
+metadata:
+  name: etcd-backup-template
+  annotations:
+    description: "Description"
+    iconClass: "icon-redis"
+    tags: "etcd,backup"
+objects:
+- apiVersion: v1
+  kind: Namespace
+  metadata:
+    name: ${NS_NAME}
+    annotations:
+      openshift.io/node-selector: node-role.kubernetes.io/master=
+- apiVersion: v1
+  kind: ServiceAccount
+  metadata:
+    name: ${SA_NAME}
+    namespace: ${NS_NAME}
+- apiVersion: batch/v1beta1
+  kind: CronJob
+  metadata:
+    name: etcd-backup
+    namespace: ${NS_NAME}
+  spec:
+    namespace: ${NS_NAME}
+    concurrencyPolicy: Replace
+    failedJobsHistoryLimit: 1
+    jobTemplate:
+      spec:
+        template:
+          spec:
+            containers:
+            - args:
+              - -c
+              - /script/backup.sh
+              command:
+              - /bin/sh
+              env:
+              - name: ETCDCTL_API
+                value: "3"
+              - name: NODE_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: spec.nodeName
+              image: quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:5ec245797eed60ffd2c360f8d8d9b2937a089cd26d7f755205b8904840a53e3c
+              imagePullPolicy: IfNotPresent
+              name: etcd-backup
+              volumeMounts:
+              - mountPath: /etc/ssl/etcd/
+                name: certs
+                readOnly: true
+              - mountPath: /backup
+                name: backup
+              - mountPath: /script
+                name: etcd-backup-script
+            dnsPolicy: ClusterFirst
+            enableServiceLinks: true
+            hostNetwork: true
+            nodeSelector:
+              beta.kubernetes.io/os: linux
+              #kubernetes.io/hostname: ${NODE_HOSTNAME}.${CLUSTER_FQDN}
+              node-role.kubernetes.io/master: ""
+            restartPolicy: OnFailure
+            serviceAccount: ${SA_NAME}
+            serviceAccountName: ${SA_NAME}
+            terminationGracePeriodSeconds: 30
+            volumes:
+            - hostPath:
+                path: /etc/kubernetes/static-pod-resources/etcd-member
+                type: ""
+              name: certs
+            - hostPath:
+                path: /tmp
+                type: ""
+              name: backup
+            - name: etcd-backup-script
+              configMap:
+                defaultMode: 0755
+                name: etcd-backup-script
+
+    schedule: ${SCHEDULE}
+    startingDeadlineSeconds: 200
+    successfulJobsHistoryLimit: 3
+    suspend: false
+- kind: ConfigMap
+  apiVersion: v1
+  metadata:
+    name: etcd-backup-script
+    namespace: ${NS_NAME}
+  data:
+    backup.sh: |
+      #!/bin/sh
+      # etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/ssl/etcd/ca.crt --cert=/etc/ssl/etcd/system:etcd-server:etcd-0.sharedocp4upi43.lab.upshift.rdu2.redhat.com.crt --key=/etc/ssl/etcd/system:etcd-server:etcd-0.sharedocp4upi43.lab.upshift.rdu2.redhat.com.key snapshot save /backup/etcd-snapshot-$(date +%Y-%m-%d_%H:%M:%S_%Z).db
+      cert_dir=/etc/ssl/etcd/
+      cacert=${cert_dir}/ca.crt
+      cert=$(ls ${cert_dir}/system:etcd-server:etcd-*crt)
+      key=$(ls ${cert_dir}/system:etcd-server:etcd-*key)
+      start_time=$(date +%Y%m%d%H%M)
+
+      backup_dir=/backup
+      #NODE_NAME is an ENV variable
+      backup_file=${backup_dir}/etc-snapshot-${NODE_NAME}-${start_time}.db
+
+      [[ ! -f "$cacert" ]] \
+        && echo "ERROR: CA cert $cacert is missing" \
+        && exit 1
+
+      [[ ! -f "$cert" ]] \
+        && echo "ERROR: cert $cert is missing" \
+        && exit 1
+
+      [[ ! -f "$key" ]] \
+        && echo "ERROR: key $key is missing" \
+        && exit 1
+
+      etcdctl --endpoints=https://127.0.0.1:2379 --cacert="${cacert}" --cert="${cert}" --key=${key} snapshot save ${backup_file}
+
+      [ "$?" -ne 0 ] \
+        && echo "ERROR: is not a valid etcd backup. Please check the status of your etcd cluster" \
+        && exit 1
+
+      tar czf ${backup_file}.tar.gz ${backup_file} --warning=no-file-changed
+      rm -f ${backup_file}
+
+parameters:
+- name: NS_NAME
+  description: Namespace used for the etcd-backup cron
+  value: etcd-backup
+  required: true
+- name: SA_NAME
+  description: Priviledeg ServiceAccount name used for the Job
+  value: etcd-backup
+  required: true
+- name: SCHEDULE
+  description: cron schedule
+  value: '*/5 * * * *'
